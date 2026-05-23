@@ -178,6 +178,17 @@ def _auto_continue_freshness_window() -> float:
         return float(_AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT)
 
 
+def _synthetic_resume_enabled() -> bool:
+    """Return whether synthetic resume heuristics are allowed.
+
+    Durable resume remains enabled regardless of this flag. This only gates
+    in-band synthetic recovery helpers such as startup auto-resume pokes and
+    next-turn interruption system notes.
+    """
+    raw = os.environ.get("HERMES_ENABLE_SYNTHETIC_RESUME", "").strip().lower()
+    return raw in {"1", "true", "yes", "on", "enabled"}
+
+
 def _float_env(name: str, default: float) -> float:
     """Read an env var as float, falling back to ``default`` on typos/empty.
 
@@ -3029,18 +3040,14 @@ class GatewayRunner:
     def _schedule_resume_pending_sessions(self) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
 
-        ``resume_pending`` already preserves the transcript AND the existing
-        ``_is_resume_pending`` branch in ``_handle_message_with_agent``
-        injects a reason-aware recovery system note on the next turn.  This
-        method closes the UX gap by synthesizing that next turn once
-        adapters are back online — the event text is empty so the existing
-        injection path owns the wording and we never double up.
-
-        Adapters that are not yet ready (adapter missing from
-        ``self.adapters``) are skipped silently; their sessions stay
-        ``resume_pending`` and will auto-resume on the next real user
-        message, or on the next gateway startup.
+        Synthetic resume is opt-in. When disabled, durable state is still
+        preserved, but the gateway does not synthesize an empty follow-up turn
+        to drive recovery inside a live chat lane.
         """
+        if not _synthetic_resume_enabled():
+            logger.info("Synthetic resume disabled; skipping startup auto-resume scheduling")
+            return 0
+
         window = _auto_continue_freshness_window()
         try:
             with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
@@ -6904,6 +6911,8 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=event.message_id,
                 channel_prompt=event.channel_prompt,
+                durable_stage_a_run_id=(_dur_handle.run_id if _dur_handle is not None else None),
+                durable_stage_a_note="top_level_run",
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -13030,6 +13039,8 @@ class GatewayRunner:
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        durable_stage_a_run_id: Optional[str] = None,
+        durable_stage_a_note: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -13318,6 +13329,8 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        durable_stage_a_run_id: Optional[str] = None,
+        durable_stage_a_note: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -13342,6 +13355,8 @@ class GatewayRunner:
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                durable_stage_a_run_id=durable_stage_a_run_id,
+                durable_stage_a_note=durable_stage_a_note,
             )
 
         from run_agent import AIAgent
@@ -14084,6 +14099,9 @@ class GatewayRunner:
                         self._enforce_agent_cache_cap()
                 logger.debug("Created new agent for session %s (sig=%s)", session_key, _sig)
 
+            agent._durable_stage_a_run_id = durable_stage_a_run_id or ""
+            agent._durable_note = durable_stage_a_note or "top_level_run"
+
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
             agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
@@ -14337,15 +14355,18 @@ class GatewayRunner:
                     _resume_entry = self.session_store._entries.get(session_key)
                 except Exception:
                     _resume_entry = None
+            _synthetic_resume_ok = _synthetic_resume_enabled()
             _is_resume_pending = bool(
                 _resume_entry is not None
                 and getattr(_resume_entry, "resume_pending", False)
                 and _interruption_is_fresh
+                and _synthetic_resume_ok
             )
             _has_fresh_tool_tail = bool(
                 agent_history
                 and agent_history[-1].get("role") == "tool"
                 and _interruption_is_fresh
+                and _synthetic_resume_ok
             )
 
             if _is_resume_pending:
@@ -15167,6 +15188,8 @@ class GatewayRunner:
                         _interrupt_depth=_interrupt_depth + 1,
                         event_message_id=next_message_id,
                         channel_prompt=next_channel_prompt,
+                        durable_stage_a_run_id=(_followup_dur_handle.run_id if _followup_dur_handle is not None else None),
+                        durable_stage_a_note="queued_followup",
                     )
                     if isinstance(_followup_result, dict) and _followup_result.get("completed", True):
                         _followup_terminal_state = "SUCCESS"
