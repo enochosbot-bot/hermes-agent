@@ -110,6 +110,7 @@ def _simulate_note_injection(
     *,
     agent_history: list | None = None,
     window_secs: float | None = None,
+    synthetic_resume_enabled: bool = False,
 ) -> str:
     """Mirror the note-injection logic in gateway/run.py _run_agent().
 
@@ -132,15 +133,18 @@ def _simulate_note_injection(
     )
 
     message = user_message
+    synthetic_resume_enabled = bool(synthetic_resume_enabled)
     is_resume_pending = bool(
         resume_entry is not None
         and getattr(resume_entry, "resume_pending", False)
         and interruption_is_fresh
+        and synthetic_resume_enabled
     )
     has_fresh_tool_tail = bool(
         agent_history
         and agent_history[-1].get("role") == "tool"
         and interruption_is_fresh
+        and synthetic_resume_enabled
     )
 
     if is_resume_pending:
@@ -293,6 +297,26 @@ class TestMarkResumePending:
         assert reloaded.resume_pending is True
         assert reloaded.resume_reason == "restart_timeout"
 
+    def test_pending_resume_event_survives_roundtrip_through_json(self, tmp_path):
+        store = _make_store(tmp_path)
+        source = _make_source()
+        entry = store.get_or_create_session(source)
+        store.mark_resume_pending(entry.session_key, reason="restart_timeout")
+        store.save_pending_resume_event(
+            entry.session_key,
+            {
+                "text": "queued during drain",
+                "message_type": "text",
+                "source": source.to_dict(),
+            },
+        )
+
+        store2 = _make_store(tmp_path)
+        store2._ensure_loaded()
+        reloaded = store2._entries[entry.session_key]
+        assert reloaded.pending_resume_event["text"] == "queued during drain"
+        assert reloaded.pending_resume_event["source"]["chat_id"] == source.chat_id
+
 
 class TestClearResumePending:
     def test_clears_flag(self, tmp_path):
@@ -300,12 +324,17 @@ class TestClearResumePending:
         source = _make_source()
         entry = store.get_or_create_session(source)
         store.mark_resume_pending(entry.session_key)
+        store.save_pending_resume_event(
+            entry.session_key,
+            {"text": "queued during drain", "message_type": "text", "source": source.to_dict()},
+        )
 
         assert store.clear_resume_pending(entry.session_key) is True
         e = store._entries[entry.session_key]
         assert e.resume_pending is False
         assert e.resume_reason is None
         assert e.last_resume_marked_at is None
+        assert e.pending_resume_event is None
 
     def test_returns_false_when_not_pending(self, tmp_path):
         store = _make_store(tmp_path)
@@ -438,6 +467,7 @@ class TestResumePendingSystemNote:
             ],
             user_message="what happened?",
             resume_entry=entry,
+            synthetic_resume_enabled=True,
         )
         assert "[System note:" in result
         assert "gateway restart" in result
@@ -451,6 +481,7 @@ class TestResumePendingSystemNote:
             ],
             user_message="ping",
             resume_entry=entry,
+            synthetic_resume_enabled=True,
         )
         assert "gateway shutdown" in result
 
@@ -462,9 +493,23 @@ class TestResumePendingSystemNote:
             {"role": "user", "content": "run a long thing", "timestamp": time.time() - 10},
             {"role": "assistant", "content": "ok, starting...", "timestamp": time.time()},
         ]
-        result = _simulate_note_injection(history, "ping", resume_entry=entry)
+        result = _simulate_note_injection(
+            history,
+            "ping",
+            resume_entry=entry,
+            synthetic_resume_enabled=True,
+        )
         assert "[System note:" in result
         assert "gateway restart" in result
+
+    def test_resume_pending_note_disabled_by_default(self):
+        entry = self._pending_entry()
+        history = [
+            {"role": "user", "content": "run a long thing", "timestamp": time.time() - 10},
+            {"role": "assistant", "content": "ok, starting...", "timestamp": time.time()},
+        ]
+        result = _simulate_note_injection(history, "ping", resume_entry=entry)
+        assert result == "ping"
 
     def test_resume_pending_subsumes_tool_tail_note(self):
         """When BOTH conditions are true, the restart-resume note wins —
@@ -477,7 +522,12 @@ class TestResumePendingSystemNote:
             {"role": "tool", "tool_call_id": "c1", "content": "result",
              "timestamp": time.time()},
         ]
-        result = _simulate_note_injection(history, "ping", resume_entry=entry)
+        result = _simulate_note_injection(
+            history,
+            "ping",
+            resume_entry=entry,
+            synthetic_resume_enabled=True,
+        )
         assert result.count("[System note:") == 1
         assert "gateway restart" in result
         # Old tool-tail wording absent
@@ -492,7 +542,12 @@ class TestResumePendingSystemNote:
             {"role": "tool", "tool_call_id": "c1", "content": "result",
              "timestamp": time.time()},
         ]
-        result = _simulate_note_injection(history, "ping", resume_entry=None)
+        result = _simulate_note_injection(
+            history,
+            "ping",
+            resume_entry=None,
+            synthetic_resume_enabled=True,
+        )
         assert "[System note:" in result
         assert "tool result" in result
 
@@ -515,6 +570,7 @@ class TestResumePendingSystemNote:
             user_message="start a new task",
             resume_entry=entry,
             window_secs=1800,
+            synthetic_resume_enabled=True,
         )
         assert result == "start a new task"
 
@@ -530,7 +586,12 @@ class TestResumePendingSystemNote:
                 "timestamp": time.time(),
             },
         ]
-        result = _simulate_note_injection(history, "ping", resume_entry=None)
+        result = _simulate_note_injection(
+            history,
+            "ping",
+            resume_entry=None,
+            synthetic_resume_enabled=True,
+        )
         assert "[System note:" in result
         assert "tool result" in result
 
@@ -556,6 +617,7 @@ class TestResumePendingSystemNote:
             "start a new task",
             resume_entry=None,
             window_secs=1800,
+            synthetic_resume_enabled=True,
         )
         assert result == "start a new task"
 
@@ -603,6 +665,7 @@ class TestResumePendingSystemNote:
             "start a new task",
             resume_entry=None,
             agent_history=agent_history,
+            synthetic_resume_enabled=True,
         )
         assert result == "start a new task"
 
@@ -620,7 +683,7 @@ class TestResumePendingSystemNote:
             },
         ]
         result = _simulate_note_injection(
-            history, "ping", resume_entry=None, window_secs=0,
+            history, "ping", resume_entry=None, window_secs=0, synthetic_resume_enabled=True,
         )
         assert "[System note:" in result
         assert "tool result" in result
@@ -634,7 +697,12 @@ class TestResumePendingSystemNote:
             ]},
             {"role": "tool", "tool_call_id": "c1", "content": "result"},
         ]
-        result = _simulate_note_injection(history, "ping", resume_entry=None)
+        result = _simulate_note_injection(
+            history,
+            "ping",
+            resume_entry=None,
+            synthetic_resume_enabled=True,
+        )
         assert "[System note:" in result
         assert "tool result" in result
 
@@ -934,13 +1002,39 @@ async def test_drain_timeout_skips_pending_sentinel_sessions():
 
 
 @pytest.mark.asyncio
-async def test_startup_auto_resume_schedules_fresh_pending_sessions():
+async def test_startup_auto_resume_disabled_by_default():
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="resume-chat", thread_id="topic-disabled")
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:group:resume-chat:topic-disabled",
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="group",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    adapter.handle_message = AsyncMock()
+
+    scheduled = runner._schedule_resume_pending_sessions()
+
+    assert scheduled == 0
+    adapter.handle_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_schedules_fresh_pending_sessions(monkeypatch):
     """Fresh resume_pending sessions should continue automatically after startup.
 
     This closes the UX gap where restart recovery only happened if the user sent
     another message after the gateway came back.
     """
     runner, adapter = make_restart_runner()
+    monkeypatch.setenv("HERMES_ENABLE_SYNTHETIC_RESUME", "1")
     source = make_restart_source(chat_id="resume-chat", thread_id="topic-1")
     pending_entry = SessionEntry(
         session_key="agent:main:telegram:group:resume-chat:topic-1",
@@ -974,7 +1068,7 @@ async def test_startup_auto_resume_schedules_fresh_pending_sessions():
 
 
 @pytest.mark.asyncio
-async def test_startup_auto_resume_includes_crash_recovery():
+async def test_startup_auto_resume_includes_crash_recovery(monkeypatch):
     """Crash-recovered sessions (reason=restart_interrupted) are also auto-resumed.
 
     suspend_recently_active() marks in-flight sessions with resume_reason
@@ -983,6 +1077,7 @@ async def test_startup_auto_resume_includes_crash_recovery():
     drain-timeout interruptions.
     """
     runner, adapter = make_restart_runner()
+    monkeypatch.setenv("HERMES_ENABLE_SYNTHETIC_RESUME", "1")
     source = make_restart_source(chat_id="crash-chat")
     pending_entry = SessionEntry(
         session_key="agent:main:telegram:dm:crash-chat",
@@ -1007,9 +1102,10 @@ async def test_startup_auto_resume_includes_crash_recovery():
 
 
 @pytest.mark.asyncio
-async def test_startup_auto_resume_skips_stale_entries():
+async def test_startup_auto_resume_skips_stale_entries(monkeypatch):
     """Entries older than the freshness window must not be auto-resumed."""
     runner, adapter = make_restart_runner()
+    monkeypatch.setenv("HERMES_ENABLE_SYNTHETIC_RESUME", "1")
     source = make_restart_source(chat_id="stale-chat")
     stale_marker = datetime.now() - timedelta(
         seconds=_auto_continue_freshness_window() + 60
